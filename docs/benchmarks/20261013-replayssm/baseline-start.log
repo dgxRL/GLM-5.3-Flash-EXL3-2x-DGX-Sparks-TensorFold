@@ -1,0 +1,90 @@
+
+
+  Mia's TensorFold Start Script
+  Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold · 2 x DGX Spark · 1 at once · 1048576-token window · fp8 KV · dflash2 drafts · port 8888
+
+[1/5] Setup: image and checkpoint on both Sparks
+[start.sh] Not ready yet: running scripts/prepare.sh (the first time this pulls the image, downloads ~166 GiB and copies both to the worker)
+[prepare.sh] Preflight checks on both Sparks
+[prepare.sh] Rail roceP2p1s0f1 <-> roceP2p1s0f1: 10.100.137.1 <-> 10.100.137.2 reaches the peer (MTU 1500): used
+[prepare.sh] Link: head 10.100.136.1 (enp1s0f1np1, rocep1s0f1, GID 3) <-> worker 10.100.136.2 (enp1s0f1np1, rocep1s0f1, GID 3)
+[prepare.sh] Disk: 1027 GB free under /home/dongsheng/.cache/huggingface here, 2184 GB under /home/dongsheng/.cache/huggingface on the worker
+[prepare.sh] Image tensorfold-glm53:baseline-e66c657a433d already built with patches e66c657a433d (use --rebuild to force)
+tensorfold 0.6.0
+[prepare.sh] Image tensorfold-glm53:baseline-e66c657a433d identical on both Sparks
+[prepare.sh] Downloading Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold @ 078455ff into /home/dongsheng/.cache/huggingface/hub (resumes if interrupted)
+Fetching 97 files:   0%|          | 0/97 [00:00<?, ?it/s]Fetching 97 files: 100%|██████████| 97/97 [00:00<00:00, 5092.98it/s]
+[prepare.sh] Checkpoint: /home/dongsheng/.cache/huggingface/hub/models--Mia-AiLab--GLM-5.3-Flash-EXL3-4bpw-TensorFold/snapshots/078455ffe6472f9a52fbc1139f58b9db2881b25c (164G)
+[prepare.sh] Downloading incoai/GLM-5.3-Flash-DFlash2 @ bf582e4e into /home/dongsheng/.cache/huggingface/hub (resumes if interrupted)
+Fetching 5 files:   0%|          | 0/5 [00:00<?, ?it/s]Fetching 5 files: 100%|██████████| 5/5 [00:00<00:00, 21377.70it/s]
+[prepare.sh] Checkpoint: /home/dongsheng/.cache/huggingface/hub/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/bf582e4eacc1810f76656d1811693ff6c6737d2a (2.2G)
+[prepare.sh] Verifying checkpoint with tensorfold info
+model_type   glm5_next
+family       GLM-5.3-Flash (tensorfold.families.glm5_next)
+engine       MLX lane engine, CUDA engine
+kernels      glm/flash/v1
+num_hidden_layers 45
+hidden_size  4096
+num_experts_per_tok 8
+n_routed_experts 288
+vocab_size   154880
+max_position_embeddings 1048576
+quantization exl3 (4-bit)
+runs on      NVIDIA GPUs (CUDA)
+sampling     {'temperature': 1.0, 'top_p': 0.95}
+[tensorfold] GLM-5.3-Flash runs on two NVIDIA GPUs with 128 GB each (two DGX Sparks): pull it on both and serve with --tp 2 on both (docs/recipes/glm-5.3-flash.md)
+[prepare.sh] Worker has Mia-AiLab/GLM-5.3-Flash-EXL3-4bpw-TensorFold @ 078455ff
+[prepare.sh] Worker has incoai/GLM-5.3-Flash-DFlash2 @ bf582e4e
+[prepare.sh] Done: both Sparks are ready. Start the server with ./start.sh (port 8888).
+[prepare.sh] The first start compiles CUDA kernels for GB10 (a few minutes); they are cached in /home/dongsheng/.cache/tensorfold-glm53/<image hash> here and under ~/.cache/tensorfold-glm53 on the worker (a folder per image).
+[2/5] Checks: arguments, link, previous server, port, memory
+[start.sh] Rail roceP2p1s0f1 <-> roceP2p1s0f1: 10.100.137.1 <-> 10.100.137.2 reaches the peer (MTU 1500): used
+[start.sh] Link: 10.100.136.1 (enp1s0f1np1) <-> 10.100.136.2 (enp1s0f1np1), RoCE rocep1s0f1,roceP2p1s0f1 / rocep1s0f1,roceP2p1s0f1 (GID 3 / 3; 2 rail(s) -> NCCL_IB_HCA, TF_ROCE_HCA)
+[start.sh] Arguments OK, port 8888 free, 116 GiB memory available here, 117 GiB on the worker
+[3/5] Launch: container glm53-flash-tf, rank 1 on dongsheng@10.100.136.2, then rank 0 here
+[start.sh] Rank 1 on dongsheng@10.100.136.2: tensorfold serve /root/.cache/huggingface/hub/models--Mia-AiLab--GLM-5.3-Flash-EXL3-4bpw-TensorFold/snapshots/078455ffe6472f9a52fbc1139f58b9db2881b25c --tp 2 --rank 1 --master 10.100.136.1 --master-port 29551 --drafter /root/.cache/huggingface/hub/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/bf582e4eacc1810f76656d1811693ff6c6737d2a --context 1048576 --parallel 1 --max-tokens 32768 --thinking --vision
+[start.sh] Rank 0 here: tensorfold serve /root/.cache/huggingface/hub/models--Mia-AiLab--GLM-5.3-Flash-EXL3-4bpw-TensorFold/snapshots/078455ffe6472f9a52fbc1139f58b9db2881b25c --tp 2 --rank 0 --master 10.100.136.1 --master-port 29551 --name GLM-5.3-Flash-EXL3 --host 0.0.0.0 --port 8888 --drafter /root/.cache/huggingface/hub/models--incoai--GLM-5.3-Flash-DFlash2/snapshots/bf582e4eacc1810f76656d1811693ff6c6737d2a --context 1048576 --parallel 1 --max-tokens 32768 --thinking --vision
+[4/5] Loading: ~80 GiB of weights on each Spark (2-6 min; the very first start also compiles CUDA kernels)
+  │ GOVERNING TERMS: The software and materials are governed by the NVIDIA Software License Agreement
+  │ (found at https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/)
+  │ and the Product-Specific Terms for NVIDIA AI Products
+  │ (found at https://www.nvidia.com/en-us/agreements/enterprise-software/product-specific-terms-for-ai-products/).
+  │ [tensorfold] GLM-5.3-Flash runs on two NVIDIA GPUs with 128 GB each (two DGX Sparks): pull it on both and serve with --tp 2 on both (docs/recipes/glm-5.3-flash.md)
+  │ [tensorfold] loading GLM-5.3-Flash-EXL3: GLM-5.3-Flash (glm5_next) on CUDA, rank 0 of 2
+  │ [W1014 05:33:35.949668333 socket.cpp:207] [c10d] The hostname of the client socket cannot be retrieved. err=-3
+  │ [tensorfold] all-gathers up to 512 KiB over RoCE (rocep1s0f1, roceP2p1s0f1; b12x's RoCEnante transport), larger ones over NCCL
+  │ [tensorfold] CUDA rank 0 startup estimate 89.14 GiB within 101.05 GiB; native 1048576, allocated prompt/reply window 1048576, cache slots 1048592
+  │ [tensorfold] other conversations' prompts are kept in 11.9 GiB, what the 1048576-token window leaves (TF_GLM_CACHE_GIB asks 12.5)
+  ⋯ 16s elapsed, 16.6 of ~89.14 GiB on the GPU here, 16.6 on the worker
+  ⋯ 33s elapsed, 41.1 of ~89.14 GiB on the GPU here, 41.1 on the worker
+  ⋯ 46s elapsed, 58.6 of ~89.14 GiB on the GPU here, 58.0 on the worker
+  │ [tensorfold] the checkpoint's MTP head is not loaded (TF_GLM_MTP=auto): DFlash2 drafts every request
+  │ [tensorfold] L2 prefetch in decode windows (bulk, up to 8 MiB a site): a 45 sites 8.0 MiB, f 45 sites 8.0 MiB, o 45 sites 8.0 MiB
+  ⋯ 62s elapsed, 84.4 of ~89.14 GiB on the GPU here, 85.8 on the worker
+  ⋯ 78s elapsed, 86.2 of ~89.14 GiB on the GPU here, 86.2 on the worker
+  ⋯ 91s elapsed, 86.4 of ~89.14 GiB on the GPU here, 86.4 on the worker
+  ⋯ 107s elapsed, 86.7 of ~89.14 GiB on the GPU here, 86.7 on the worker
+  ⋯ 123s elapsed, 86.9 of ~89.14 GiB on the GPU here, 86.9 on the worker
+  │ [tensorfold] prompt chunks' hyper-connections: rows split between the ranks, exchanges by send/receive on a second stream in 2 pieces, the next block's front on own rows meanwhile (chunks of 64+ rows)
+  │ [tensorfold] verify windows up to 16 rows, CUDA graphs for 1, 2, 3, 4, 5, 6, 7, 8, 16 rows (TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS); copies from the reply match 16 tokens (TF_GLM_COPY_REPLY_MATCH)
+  │ [tensorfold] TF_GLM_KV=fp8: the DSA latent cache and the indexer's pooled keys as e4m3 rows with a power-of-two scale each (lossy; drafted replies still equal serial ones)
+  │ [tensorfold] prompt chunks and kept prompt states on a 64-token grid (TF_GLM_PROMPT_GRID)
+  │ [tensorfold] TF_GLM_KDA_CHUNKED=1: KDA prompt chunks in chunked (WY) form, 32-row sub-chunks (close to the serial kernel, not its bits; decode keeps the serial kernel)
+  │ [tensorfold] shared-prefix prompt states: kept where a prompt stops sharing another and at the end of its system block, when they add 256+ tokens (TF_GLM_SHARED_PREFIX)
+  │ [tensorfold] drafter timings (ms, fastest of 7): {'v1': 26.67, 'v2': 33.26, 'v3': 39.38, 'v4': 45.6, 'v5': 49.88, 'v6': 54.66, 'v7': 56.24, 'v8': 59.16, 'block': 2.92, 'taps8': 0.36}
+  │ [tensorfold] drafter costs (ms): verify 26.7 35.1 39.4 43.7 48.0 52.3 56.6 61.0; DFlash2 block 2.92 (+0.045 a tap row)
+  │ [tensorfold] vision: image and video input, a 1.05 GiB tower with 0.75 GiB of workspace; at most 2048 tokens a picture, 16384 a clip (128 frames at 2 a second)
+  │ [tensorfold] serving GLM-5.3-Flash-EXL3 at http://0.0.0.0:8888/v1 on CUDA, rank 0 of 2 (sampling: temperature 1.0, top_p 0.95; drafts: on; prompts: bf16 activations; context: 1048576; loaded in 129.1s)
+[start.sh] Server answered after 132s
+[5/5] Smoke test: one chat completion through both ranks
+[start.sh] OK: 'OK', 2 tokens, 0.05319483601488173 s
+
+  ✔ GLM-5.3-Flash-EXL3 is now LIVE! on port 8888
+
+    API      http://10.117.178.105:8888/v1   (model: GLM-5.3-Flash-EXL3)
+    Window   1048576 tokens · 1 at once · fp8 KV · dflash2 drafts · q4 dense weights · images and video · RoCE all-gathers · split prefill · chunked KDA
+    Drafts   fnc7:0.3 · copy drafts up to 15, code rules · shared system prompts on
+    Logs     docker logs -f glm53-flash-tf   (rank 1: ssh dongsheng@10.100.136.2 docker logs -f glm53-flash-tf)
+    Restart  ./start.sh restart
+    Stop     ./stop.sh
+

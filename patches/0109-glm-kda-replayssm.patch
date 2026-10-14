@@ -1,6 +1,6 @@
 diff -r tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
---- tensorfold/families/glm5_next/cuda/decode.py	2026-10-13 20:18:36.737475789 -0700
-+++ tensorfold/families/glm5_next/cuda/decode.py	2026-10-13 20:16:43.609945184 -0700
+--- tensorfold/families/glm5_next/cuda/decode.py
++++ tensorfold/families/glm5_next/cuda/decode.py
 @@ -12,7 +12,7 @@
  from tensorfold.cuda.sampling import comm_gather, nucleus_rows, one_rank
  from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
@@ -103,9 +103,9 @@ diff -r tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_ne
      st.set_mtp_len(max(snap.mtp_len, 0))
      st.mtp_drafted = 0
 diff -r tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
---- tensorfold/families/glm5_next/cuda/engine.py	2026-10-13 20:18:36.604068479 -0700
-+++ tensorfold/families/glm5_next/cuda/engine.py	2026-10-13 20:17:45.654910140 -0700
-@@ -63,6 +63,16 @@
+--- tensorfold/families/glm5_next/cuda/engine.py
++++ tensorfold/families/glm5_next/cuda/engine.py
+@@ -63,6 +63,18 @@
  DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays dense (contexts up to 2,051 tokens)
  # TF_GLM_DRAFT_RING=0: DFlash2's context in a flat buffer of the whole window, not a 2,176-row ring (the same drafts)
  DRAFT_RING = os.environ.get("TF_GLM_DRAFT_RING", "1").strip() != "0"
@@ -118,23 +118,26 @@ diff -r tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_ne
 +REPLAY = os.environ.get("TF_GLM_KDA_REPLAY", "").strip() not in ("", "0")
 +if REPLAY:
 +    os.environ.setdefault("TF_GLM_KDA_REPLAY_LEN", "16")
-+REPLAY_LEN = int(os.environ.get("TF_GLM_KDA_REPLAY_LEN", "0"))
++REPLAY_LEN = int(os.environ.get("TF_GLM_KDA_REPLAY_LEN", "16")) if REPLAY else 0
++if REPLAY and REPLAY_LEN < 1:
++    raise ValueError("TF_GLM_KDA_REPLAY_LEN must be positive when TF_GLM_KDA_REPLAY is enabled")
  # --vision (rank 0): what startup reserves beside the tower's 1.05 GiB of bf16 weights for an encode and its
  # prompt's feature rows (8 KiB a row, which stay through the prefill). The encode's scratch takes turns with a prompt
  # chunk's transient scratch (~1 GiB at 164k), so this covers the rows and the scratch past it. A picture cap past
-@@ -363,8 +373,10 @@
+@@ -363,8 +375,10 @@
  def slot_bytes(t: dict, world: int = 2, rows: int = MAX_ROWS, rank: int = 0) -> int:
      """What one more stream slot (``forward.Slots``) takes on rank ``rank`` of ``world``, from the text config:
      every KDA layer's recurrent states (two parities), conv window, a decode window's projections and replay
 -    scratch."""
+-
 +    scratch, and under TF_GLM_KDA_REPLAY the replay buffer's planes (L + rows rows a layer: k/g fp32, v bf16,
 +    beta fp32, h mirror)."""
- 
++
 +    from .kda import REPLAY_LEN as kda_replay_len
      from tensorfold.cuda.geometry import layer_counts
  
      from .tp import UNITS, split_sizes
-@@ -376,7 +388,12 @@
+@@ -376,7 +390,12 @@
      conv = int(lin.get("short_conv_kernel_size", t.get("linear_conv_kernel_dim", 4)))
      width = 3 * lh * ld + 2 * ld + lh                  # the KDA input projection's rows (q, k, v, f_a, g_a, beta)
      scratch = rows * lh * (ld * 2 + ld * 4 + ld * 2 + ld * 4 + 4)
@@ -148,7 +151,7 @@ diff -r tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_ne
  
  
  def multi_draft_bytes(t: dict, streams: int, world: int = 2, *, ring: bool, capacity: int,
-@@ -532,6 +549,9 @@
+@@ -532,6 +551,9 @@
          if not 1 <= parallel <= PARALLEL_MOST:
              raise ValueError(f"--parallel: 1 to {PARALLEL_MOST} requests at once for GLM-5.3-Flash, not {parallel}")
          self.parallel = parallel
@@ -158,7 +161,7 @@ diff -r tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_ne
          self.spill_cfg = spill                # --spill-gib: a ``spill.SpillConfig`` (both ranks alike), else None
          if spill is not None:                 # its write buffers pinned now, before the caches are sized
              from tensorfold.cuda.spill import preallocate
-@@ -695,7 +715,7 @@
+@@ -695,7 +717,7 @@
              self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(DRAFT_RING), int(self.mtp_on),
                                   parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
                                   sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
@@ -167,7 +170,7 @@ diff -r tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_ne
          # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
          plan = self.capacity_plan
          wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
-@@ -713,6 +733,7 @@
+@@ -713,6 +735,7 @@
                                 "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
                                 "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _WINDOW, "
                                 "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_ASSISTANT_ENDS, "
@@ -175,7 +178,7 @@ diff -r tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_ne
                                 "TF_GLM_DRAFT_PRELAUNCH): "
                                 f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
                                 "; pull the draft model on every machine (or pass --drafter none to all) and give "
-@@ -833,6 +854,10 @@
+@@ -833,6 +856,10 @@
          if rank == 0 and kda_chunked_on():
              print("[tensorfold] TF_GLM_KDA_CHUNKED=1: KDA prompt chunks in chunked (WY) form, 32-row sub-chunks "
                    "(close to the serial kernel, not its bits; decode keeps the serial kernel)", flush=True)
@@ -187,8 +190,8 @@ diff -r tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_ne
          self.opener = user_opener(model_dir) if self.shared and rank == 0 else None
          if rank == 0 and self.shared:
 diff -r tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
---- tensorfold/families/glm5_next/cuda/forward.py	2026-10-13 20:18:36.637297901 -0700
-+++ tensorfold/families/glm5_next/cuda/forward.py	2026-10-13 20:15:33.542764297 -0700
+--- tensorfold/families/glm5_next/cuda/forward.py
++++ tensorfold/families/glm5_next/cuda/forward.py
 @@ -347,6 +347,16 @@
          self.proj = sl.proj[slot]
          self.scratch_set = sl.scratch[slot]
@@ -201,7 +204,7 @@ diff -r tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_n
 +        if kda_mod.REPLAY_LEN and n:
 +            cap = kda_mod.REPLAY_LEN + rows
 +            self.rb_k, self.rb_v, self.rb_g, self.rb_b, self.rb_h_dev = kda_mod.replay_planes(
-+                n, w.cfg.lin_heads // w.world, cap, w.device)
++                n, tp.of(w).lin_heads, cap, w.device)
 +            self.rb_idx = torch.arange(cap, device=w.device)
          self.latent = latent.ENABLED
          self.mtp_len = 0
@@ -231,7 +234,7 @@ diff -r tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_n
          other.pos_dev = self.pos_dev.clone()
          other.mtp_pos_dev = self.mtp_pos_dev.clone()
          other.kc = [x.clone() for x in self.kc]
-@@ -519,12 +540,60 @@
+@@ -519,10 +540,61 @@
      else:
          cur = st.cur[li]
          with prof.timed("kda: recurrence"):
@@ -244,11 +247,11 @@ diff -r tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_n
 +                                    k.dt_bias, k.norm, c.eps, c.lower, R, st.scratch[li], st.rec[1 - cur, li])
      with prof.timed("kda: out + all-gather"):
          return out_proj(w, b, out, k.o, None if pre else qmm.group_sums(out, b.kxs[:R]), R, site=(layer.index, "a"))
- 
- 
++
++
 +def _replay_neutral(st: State, h: int) -> None:
 +    """Rows h.. of the replay buffer neutral again (k = v = b = 0, g = 1: update's identity), so the flush's fixed
-+    L-row replay reads exactly the committed rows 0..h-1 whatever older rounds left there."""
++    capacity-row replay reads exactly the committed rows 0..h-1 whatever older rounds left there."""
 +
 +    for li in range(len(st.cur)):
 +        st.rb_k[li][h:].zero_()
@@ -262,7 +265,7 @@ diff -r tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_n
 +    """The decode round's KDA on the checkpoint + replay buffer (TF_GLM_KDA_REPLAY). The wide prep stages the rows'
 +    post-conv inputs (the wide scratch's saves, free while no step runs) and they scatter to buffer rows h..h+R at
 +    the device h; when the window would overflow (h + R > L) the committed rows flush into the other parity's
-+    checkpoint with a fixed L-row replay -- rows h..L-1 are neutral (``_replay_neutral``), so its bits are the serial
++    checkpoint with a fixed capacity-row replay -- rows h..cap-1 are neutral (``_replay_neutral``), so its bits are the serial
 +    steps over rows 0..h-1 exactly -- then out_only reads the round's outputs from the checkpoint + buffer with no
 +    state write (h from the device mirror, so a captured graph serves any h) and the wide path's out_kernel norms
 +    the read-out. A rejected draft's commit is a buffer-pointer move (``commit``)."""
@@ -277,8 +280,11 @@ diff -r tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_n
 +        kda_mod.prep(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, k.a_log, k.dt_bias, c.lower, R,
 +                     s.k[:R], s.v[:R], s.g[:R], s.b[:R], q_tmp[:R])
 +    if flush:
-+        kda_mod._ext().replay(st.rec[cur, li], st.rb_k[li][:L], st.rb_v[li][:L], st.rb_g[li][:L], st.rb_b[li][:L],
-+                              L, st.rec[1 - cur, li])
++        # A round may accept more than L rows. Fold every committed row, including those past L; the unused
++        # capacity is neutral, so the fixed launch also works in a CUDA graph with a device-only h.
++        cap = st.rb_k.shape[1]
++        kda_mod._ext().replay(st.rec[cur, li], st.rb_k[li], st.rb_v[li], st.rb_g[li], st.rb_b[li],
++                              cap, st.rec[1 - cur, li])
 +        st.rb_h_dev.zero_()
 +    at = st.rb_idx[:R] + st.rb_h_dev   # the rows' places, on the device with h (graph-capturable)
 +    st.rb_k[li].index_copy_(0, at, s.k[:R])
@@ -289,12 +295,10 @@ diff -r tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_n
 +                     q_tmp[:R], st.rb_h_dev, R, y_tmp[:R].reshape(R, -1))
 +    kda_mod.out_norm(y_tmp[:R].reshape(R, -1), b.kg[:R], b.kg.stride(0), k.norm, c.eps, s.out[:R])
 +    return s.out[:R]
-+
-+
- def _scratch_rows(s, lo: int):
-     """A prompt buffer's KDA scratch from row ``lo`` on (the same storage)."""
  
-@@ -1133,6 +1202,24 @@
+ 
+ def _scratch_rows(s, lo: int):
+@@ -1133,6 +1205,24 @@
  
      if not 1 <= keep <= R or (b.prefill and keep != R):
          raise ValueError("keep must be in 1..R, and all of a prompt chunk")
@@ -306,7 +310,7 @@ diff -r tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_n
 +        else:
 +            # the round left the states where they are (no replay_layers, no parity flip): the kept rows stay in the
 +            # buffer, so a rejected draft was a pointer move, and a flush's checkpoint move is replayed by the same
-+            # rule kda_block used; rows past the new h go neutral again for the next flush's fixed L-row replay
++            # rule kda_block used; rows past the new h go neutral again for the next flush's fixed-capacity replay
 +            flushed = st.rb_h + R > kda_mod.REPLAY_LEN
 +            st.rb_h = keep if flushed else st.rb_h + keep
 +            _replay_neutral(st, st.rb_h)
@@ -320,8 +324,8 @@ diff -r tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_n
      if n:
          cur = st.cur[0]
 diff -r tensorfold/families/glm5_next/cuda/graphs.py tensorfold/families/glm5_next/cuda/graphs.py
---- tensorfold/families/glm5_next/cuda/graphs.py	2026-10-13 20:18:34.889010142 -0700
-+++ tensorfold/families/glm5_next/cuda/graphs.py	2026-10-13 20:15:33.543500796 -0700
+--- tensorfold/families/glm5_next/cuda/graphs.py
++++ tensorfold/families/glm5_next/cuda/graphs.py
 @@ -21,25 +21,32 @@
  class Graphs:
      def __init__(self, e, main_rows=(1, 2, 3, 4), mtp_rows=(1, 2, 3, 4)) -> None:
@@ -369,11 +373,11 @@ diff -r tensorfold/families/glm5_next/cuda/graphs.py tensorfold/families/glm5_ne
                      self.mtp[n] = g
              if st.index is not None and latent.ENABLED:
 -                self._capture_sparse(e, main_rows, mtp_rows, parities)
-+                self._capture_sparse(e, main_rows, parities, replay, L)
++                self._capture_sparse(e, main_rows, mtp_rows, parities, replay, L)
          torch.cuda.synchronize()
  
 -    def _capture_sparse(self, e, main_rows, mtp_rows, parities) -> None:
-+    def _capture_sparse(self, e, main_rows, parities, replay, L) -> None:
++    def _capture_sparse(self, e, main_rows, mtp_rows, parities, replay, L) -> None:
          w, st = e.w, e.st
          np_max = st.index[0][2].shape[0] - 2
          saved = list(st.cur)
@@ -424,8 +428,8 @@ diff -r tensorfold/families/glm5_next/cuda/graphs.py tensorfold/families/glm5_ne
 +    if st.rb_h_dev is not None:
 +        st.rb_h_dev.fill_(st.rb_h)
 diff -r tensorfold/families/glm5_next/cuda/kda.cpp tensorfold/families/glm5_next/cuda/kda.cpp
---- tensorfold/families/glm5_next/cuda/kda.cpp	2026-10-13 20:18:35.375315433 -0700
-+++ tensorfold/families/glm5_next/cuda/kda.cpp	2026-10-13 20:15:33.544107379 -0700
+--- tensorfold/families/glm5_next/cuda/kda.cpp
++++ tensorfold/families/glm5_next/cuda/kda.cpp
 @@ -22,6 +22,15 @@
  void kda_replay_layers_segments_cuda(const at::Tensor&, int64_t, at::Tensor&, int64_t, int64_t, int64_t,
                                       const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
@@ -570,14 +574,15 @@ diff -r tensorfold/families/glm5_next/cuda/kda.cpp tensorfold/families/glm5_next
      m.def("replay_layers", &replay_layers);
      m.def("chain_wide_segments", &chain_wide_segments);
      m.def("replay_layers_segments", &replay_layers_segments);
+-}
 +    m.def("out_only", &out_only);
 +    m.def("out_only_seg", &out_only_seg);
 +    m.def("out_norm", &out_norm);
 +    m.def("prep", &prep);
- }
++}
 diff -r tensorfold/families/glm5_next/cuda/kda.cu tensorfold/families/glm5_next/cuda/kda.cu
---- tensorfold/families/glm5_next/cuda/kda.cu	2026-10-13 20:18:35.375933724 -0700
-+++ tensorfold/families/glm5_next/cuda/kda.cu	2026-10-13 20:15:33.544914878 -0700
+--- tensorfold/families/glm5_next/cuda/kda.cu
++++ tensorfold/families/glm5_next/cuda/kda.cu
 @@ -7,7 +7,9 @@
  // read-out rounded to bf16; then the gated RMSNorm bf16(w * (y * rsqrt(mean(y^2) + eps)) * sigmoid(gate)).
  // Warp w owns value rows 4w .. 4w + 3, lane l the key columns 4l .. 4l + 3. The state update is one routine
@@ -589,10 +594,12 @@ diff -r tensorfold/families/glm5_next/cuda/kda.cu tensorfold/families/glm5_next/
  
  #include <ATen/ATen.h>
  #include <ATen/cuda/CUDAContext.h>
-@@ -352,6 +354,54 @@
+@@ -350,6 +352,54 @@
+     const float yw = __bfloat162float(norm_w[t]) * yn;
+     const float gate = __bfloat162float(G[(size_t)r * g_stride + h * DV + t]);
      out[(size_t)r * H * DV + h * DV + t] = __float2bfloat16_rn(yw * sigmoidf_(gate));
- }
- 
++}
++
 +// Decode outputs from a checkpoint and the replay buffer without touching the state: rows 0..h0 - 1 of the
 +// buffer are committed, the round's ``rows`` rows follow, and the kernel runs the same ``update`` over all
 +// h0 + rows saved rows on a register copy of the checkpoint (replay_kernel's loop) but only reads out the rows
@@ -639,11 +646,9 @@ diff -r tensorfold/families/glm5_next/cuda/kda.cu tensorfold/families/glm5_next/
 +        }
 +        __syncthreads();
 +    }
-+}
-+
+ }
+ 
  // Several streams' windows in one launch. A segment table (int32 [nseg, SEG_COLS]: first row, rows, state slot,
- // parity, conv slot, keep) cuts the window's rows into streams; each segment reads its conv taps from its own
- // conv slot and runs the recurrence from rec[slot, parity] into rec[slot, 1 - parity]. Per row the arithmetic is
 @@ -485,6 +535,56 @@
          for (int i = 0; i < 4; ++i) state_out[sbase + (size_t)(warp * 4 + j) * DK + lane * 4 + i] = s[j][i];
  }
@@ -758,8 +763,8 @@ diff -r tensorfold/families/glm5_next/cuda/kda.cu tensorfold/families/glm5_next/
 +    C10_CUDA_KERNEL_LAUNCH_CHECK();
 +}
 diff -r tensorfold/families/glm5_next/cuda/kda.py tensorfold/families/glm5_next/cuda/kda.py
---- tensorfold/families/glm5_next/cuda/kda.py	2026-10-13 20:18:35.600911764 -0700
-+++ tensorfold/families/glm5_next/cuda/kda.py	2026-10-13 20:15:33.545342003 -0700
+--- tensorfold/families/glm5_next/cuda/kda.py
++++ tensorfold/families/glm5_next/cuda/kda.py
 @@ -1,4 +1,4 @@
 -"""Fused KDA chains and prefix replay use the same state update routine so a kept prefix preserves serial bits."""
 +"""Fused KDA chains and prefix replay use the same state update routine so a kept prefix preserves serial bits, and ``out_only`` reads a decode round's outputs from the checkpoint plus its buffer rows with those bits."""
@@ -775,7 +780,7 @@ diff -r tensorfold/families/glm5_next/cuda/kda.py tensorfold/families/glm5_next/
                  extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
  
  
-@@ -176,3 +176,90 @@
+@@ -176,3 +176,93 @@
      L, H = scratch.layers, scratch.heads
      _ext().replay_layers_segments(seg, rec, scratch.k, scratch.v, scratch.g, scratch.b, scratch.rows * H * DK,
                                    scratch.rows * H, L, H)
@@ -787,7 +792,10 @@ diff -r tensorfold/families/glm5_next/cuda/kda.py tensorfold/families/glm5_next/
 +# buffer-pointer move and commit does not re-run replay_layers. When the buffer would overflow the window L, the
 +# committed rows flush through replay (the exact bits of the serial steps) and the round's rows compact to the
 +# front. Single-stream only in this patch.
-+REPLAY_LEN = int(os.environ.get("TF_GLM_KDA_REPLAY_LEN", "0"))  # 0 = off; else the window L
++REPLAY = os.environ.get("TF_GLM_KDA_REPLAY", "").strip() not in ("", "0")
++REPLAY_LEN = int(os.environ.get("TF_GLM_KDA_REPLAY_LEN", "16")) if REPLAY else 0
++if REPLAY and REPLAY_LEN < 1:
++    raise ValueError("TF_GLM_KDA_REPLAY_LEN must be positive when TF_GLM_KDA_REPLAY is enabled")
 +_rb: dict = {}
 +
 +

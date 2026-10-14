@@ -11,7 +11,11 @@ Every change to this recipe, newest first. Each release names the image it serve
   rejected drafts roll back by moving the buffer pointer instead of the eager state replay. The replay re-runs the
   serial update over the buffered rows, so every round's outputs and every flush's checkpoint are the eager path's
   bits. Off by default (`KDA_REPLAY=0`) and single-stream decode only for now: the engine refuses to start with
-  `PARALLEL` above 1 while it is set. On-Spark validation and measurements pending.
+  `PARALLEL` above 1 while it is set. Fixed the disabled flag, sparse MTP graph capture, uneven TP head allocation,
+  and flushes after accepting more rows than the replay window. `start.sh` checks replay settings before launch.
+  GPU checks (`tools/kda_replay_check.py`, windows 2 and 16, 32 and 22 heads, eager and CUDA graphs) match the eager
+  recurrence's outputs and committed states. On two Sparks, drafted and serial 128-token replies have identical
+  token hashes at 23- and 4,343-token prompts with replay enabled. Replay-on/off performance comparison pending.
 - **A prompt that fills beside other replies, ~10-14% sooner** (`FILL_ROWS`, by [BadAd84](https://github.com/BadAd84)):
   while other requests decode, a new prompt filled in 1,024-row chunks (TensorFold's `TF_GLM_FILL_ROWS` default),
   half the 2,048-row prompt chunk whose buffers the engine keeps anyway. `scripts/config.sh` now sets 2,048 (at

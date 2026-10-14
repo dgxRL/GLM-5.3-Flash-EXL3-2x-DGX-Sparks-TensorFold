@@ -186,7 +186,7 @@ export TF_GLM_KDA_CHUNKED="$KDA_CHUNKED"
 # KDA_REPLAY_LEN committed tokens), and rejected drafts roll back by moving the buffer pointer instead of a state
 # replay. Every round's outputs and every flush's checkpoint are the eager path's bits (the replay re-runs the serial
 # update over the buffered rows). Single-stream decode only: the engine refuses to start with PARALLEL > 1 while set.
-# TF_GLM_KDA_REPLAY_LEN is the window (16, the paper's L). 0: off (the eager per-round state write, as before).
+# TF_GLM_KDA_REPLAY_LEN is the positive window size (16 by default). KDA_REPLAY=0 keeps eager state writes.
 KDA_REPLAY="${KDA_REPLAY:-0}"
 KDA_REPLAY_LEN="${KDA_REPLAY_LEN:-16}"
 export TF_GLM_KDA_REPLAY="$KDA_REPLAY" TF_GLM_KDA_REPLAY_LEN="$KDA_REPLAY_LEN"
