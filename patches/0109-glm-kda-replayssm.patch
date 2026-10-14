@@ -1,0 +1,868 @@
+diff -r tensorfold/families/glm5_next/cuda/decode.py tensorfold/families/glm5_next/cuda/decode.py
+--- tensorfold/families/glm5_next/cuda/decode.py	2026-10-13 20:18:36.737475789 -0700
++++ tensorfold/families/glm5_next/cuda/decode.py	2026-10-13 20:16:43.609945184 -0700
+@@ -12,7 +12,7 @@
+ from tensorfold.cuda.sampling import comm_gather, nucleus_rows, one_rank
+ from tensorfold.engine.exact_sampling import MARGIN, Sampling, choose_rows
+ 
+-from . import glue, prof, qmm, tp
++from . import glue, kda as kda_mod, prof, qmm, tp
+ from .forward import Buffers, State, chunks_for, commit, compute, stage
+ from .mtp import mtp_compute, mtp_forward, mtp_stage
+ from .sparse import pool_bucket
+@@ -171,6 +171,9 @@
+             from . import kda as kda_mod
+ 
+             kda_mod.reserve(max(max_rows, prefill_rows), tp.of(w).lin_heads, w.device)
++            if kda_mod.REPLAY_LEN:                           # the replay buffer's planes, before any capture
++                kda_mod.reserve_replay(len([l for l in w.layers if l.kind == "kda"]), tp.of(w).lin_heads,
++                                       kda_mod.REPLAY_LEN + max_rows, w.device)
+         self.buf = Buffers(w, max_rows, capacity)
+         # the row split's pad rows past a full chunk (``hcsplit.pad_rows``: 0 at two and four ranks, 1 at three)
+         from .hcsplit import buffer_rows
+@@ -237,28 +240,34 @@
+ 
+     def graphed(self, st: State | None = None) -> bool:
+         """Whether the captured graphs run ``st`` (default the current state): the same slot and extent base as the
+-        state they were captured on (and the pool's views, not a clone's)."""
++        state they were captured on (and the pool's views, not a clone's). With TF_GLM_KDA_REPLAY the graphs bake
++        the home state's buffer scatter indices, so only it replays them."""
+ 
+         st = self.st if st is None else st
+         return (self.graphs is not None and st.caches is self.caches and st.slots is self.slots
+-                and st.graph_key == self.home.graph_key)
++                and st.graph_key == self.home.graph_key
++                and not (kda_mod.REPLAY_LEN and st.rb_k is not None and st is not self.home))
+ 
+     def forward(self, tokens: Sequence[int]) -> torch.Tensor:
+         """A step's forward (a CUDA graph when one was captured for its shape and state): logits [R, V/world]."""
+ 
+         R = stage(self.w, self.st, self.buf, tokens)
+         dense = self.st.pos + R <= self.w.cfg.dense_limit
++        replay = bool(kda_mod.REPLAY_LEN) and self.st.rb_k is not None
+         g, kind = None, "main"
+         if not self.graphed():
+             pass
+         elif self.graphs is not None and dense:
+-            g = self.graphs.main.get((R, self.st.parity))
++            # a flush round runs the other graph (kda_block's rule, host-known before the lookup)
++            key = (R, self.st.parity) + ((self.st.rb_h + R > kda_mod.REPLAY_LEN,) if replay else ())
++            g = self.graphs.main.get(key)
+         elif self.graphs is not None and self.st.pos >= self.w.cfg.dense_limit and self.st.index is not None:
+             # every row past the dense limit: the sparse graph for this pool bucket (same kernels as eager)
+             # the pool buckets the graphs were captured for: the home view's (a stream at home with a smaller
+             # extent scores pools past its own too, all past its visible ones: -inf, the same selection)
+             bucket = pool_bucket(self.st.pos, R, self.home.index[0][2].shape[0] - 2)
+-            g, kind = self.graphs.sparse.get((R, self.st.parity, bucket)), "sparse"
++            key = (R, self.st.parity) + ((self.st.rb_h + R > kda_mod.REPLAY_LEN,) if replay else ()) + (bucket,)
++            g, kind = self.graphs.sparse.get(key), "sparse"
+         if g is not None:
+             self.replays[kind] += 1
+             g.replay()
+@@ -388,6 +397,9 @@
+     # own end state: a request of exactly these ids resumes here and samples its first token from it, prefilling
+     # nothing (``prefill``); None for states short of a prompt's end (which no head ran for)
+     head: torch.Tensor | None = None
++    # TF_GLM_KDA_REPLAY: the replay buffer's planes and committed count at ids' end (None without)
++    rb: tuple | None = None
++    rb_h: int = 0
+ 
+ 
+ def _ring_tail(st, n: int, m: int) -> list[tuple[torch.Tensor, torch.Tensor]]:
+@@ -433,9 +445,10 @@
+     st = e.st
+     rec = st.rec[st.cur[0]].clone() if st.cur else st.rec[0].clone()
+     mtp_len = st.mtp_len - st.mtp_drafted if mtp and pending is not None else -1
++    rb = tuple(x.clone() for x in (st.rb_k, st.rb_v, st.rb_g, st.rb_b)) if st.rb_k is not None else None
+     snap = Snapshot(list(ids), rec, st.conv.clone(), pending.clone() if pending is not None else None,
+                     mtp_len, drafter.context_end if drafter is not None else -1,
+-                    tail=_ring_tail(st, len(ids), max(mtp_len, 0)))
++                    tail=_ring_tail(st, len(ids), max(mtp_len, 0)), rb=rb, rb_h=st.rb_h)
+     if drafter is not None and getattr(drafter, "ring", 0) and snap.drafter_end == len(snap.ids):
+         snap.drafter_rows = _ring_window(drafter, len(snap.ids))
+     return snap
+@@ -516,6 +529,7 @@
+     """Device memory a kept snapshot holds: its KDA states, conv windows, pending MTP rows, a ring drafter's window,
+     the indexer rings' tail and any saved rows."""
+     held = [snap.rec, snap.conv] + ([snap.pending] if snap.pending is not None else []) + (snap.drafter_rows or [])
++    held += list(snap.rb or [])
+     held += [snap.head] if snap.head is not None else []
+     held += [t for pair in (snap.tail or []) for t in pair]
+     return sum(t.numel() * t.element_size() for t in held) + (snap.nbytes if snap.rows is not None else 0)
+@@ -536,6 +550,12 @@
+     if st.cur:
+         st.rec[st.cur[0]].copy_(snap.rec)
+     st.conv.copy_(snap.conv)
++    if st.rb_k is not None and snap.rb is not None:
++        # the buffer planes and committed count the snapshot left (the live conversation's, since single-stream)
++        for dst, src in zip((st.rb_k, st.rb_v, st.rb_g, st.rb_b), snap.rb):
++            dst.copy_(src)
++        st.rb_h = snap.rb_h
++        st.rb_h_dev.fill_(snap.rb_h)
+     st.set_pos(len(snap.ids))
+     st.set_mtp_len(max(snap.mtp_len, 0))
+     st.mtp_drafted = 0
+diff -r tensorfold/families/glm5_next/cuda/engine.py tensorfold/families/glm5_next/cuda/engine.py
+--- tensorfold/families/glm5_next/cuda/engine.py	2026-10-13 20:18:36.604068479 -0700
++++ tensorfold/families/glm5_next/cuda/engine.py	2026-10-13 20:17:45.654910140 -0700
+@@ -63,6 +63,16 @@
+ DENSE_CAPACITY = 2560                 # cache slots while DSA attention stays dense (contexts up to 2,051 tokens)
+ # TF_GLM_DRAFT_RING=0: DFlash2's context in a flat buffer of the whole window, not a 2,176-row ring (the same drafts)
+ DRAFT_RING = os.environ.get("TF_GLM_DRAFT_RING", "1").strip() != "0"
++# TF_GLM_KDA_REPLAY=1: KDA decode from a checkpoint plus a replay buffer of post-conv rows (ReplaySSM): outputs on
++# non-flush rounds come with no state write, so a rejected draft's commit is a buffer-pointer move. out_only re-runs
++# the serial update over the buffered rows on a register copy of the checkpoint, so every round's outputs and every
++# flush's checkpoint are the eager path's bits; single-stream only in this patch. TF_GLM_KDA_REPLAY_LEN is the
++# buffer's window L (16 rows by default; the planes hold L + TF_GLM_MAX_ROWS rows) -- set before kda reads it at its
++# import, which is why this sits above every relative import of this module
++REPLAY = os.environ.get("TF_GLM_KDA_REPLAY", "").strip() not in ("", "0")
++if REPLAY:
++    os.environ.setdefault("TF_GLM_KDA_REPLAY_LEN", "16")
++REPLAY_LEN = int(os.environ.get("TF_GLM_KDA_REPLAY_LEN", "0"))
+ # --vision (rank 0): what startup reserves beside the tower's 1.05 GiB of bf16 weights for an encode and its
+ # prompt's feature rows (8 KiB a row, which stay through the prefill). The encode's scratch takes turns with a prompt
+ # chunk's transient scratch (~1 GiB at 164k), so this covers the rows and the scratch past it. A picture cap past
+@@ -363,8 +373,10 @@
+ def slot_bytes(t: dict, world: int = 2, rows: int = MAX_ROWS, rank: int = 0) -> int:
+     """What one more stream slot (``forward.Slots``) takes on rank ``rank`` of ``world``, from the text config:
+     every KDA layer's recurrent states (two parities), conv window, a decode window's projections and replay
+-    scratch."""
++    scratch, and under TF_GLM_KDA_REPLAY the replay buffer's planes (L + rows rows a layer: k/g fp32, v bf16,
++    beta fp32, h mirror)."""
+ 
++    from .kda import REPLAY_LEN as kda_replay_len
+     from tensorfold.cuda.geometry import layer_counts
+ 
+     from .tp import UNITS, split_sizes
+@@ -376,7 +388,12 @@
+     conv = int(lin.get("short_conv_kernel_size", t.get("linear_conv_kernel_dim", 4)))
+     width = 3 * lh * ld + 2 * ld + lh                  # the KDA input projection's rows (q, k, v, f_a, g_a, beta)
+     scratch = rows * lh * (ld * 2 + ld * 4 + ld * 2 + ld * 4 + 4)
+-    return linear * (2 * lh * ld * ld * 4 + (conv - 1) * 3 * lh * ld * 2 + rows * width * 2 + scratch)
++    if not kda_replay_len:
++        return linear * (2 * lh * ld * ld * 4 + (conv - 1) * 3 * lh * ld * 2 + rows * width * 2 + scratch)
++    # the planes are one conversation's, sized at startup (L + MAX_ROWS), not per stream slot
++    cap = kda_replay_len + MAX_ROWS
++    return linear * (2 * lh * ld * ld * 4 + (conv - 1) * 3 * lh * ld * 2 + rows * width * 2 + scratch) \
++        + linear * cap * lh * (ld * 10 + 4) + 4 + 8 * cap
+ 
+ 
+ def multi_draft_bytes(t: dict, streams: int, world: int = 2, *, ring: bool, capacity: int,
+@@ -532,6 +549,9 @@
+         if not 1 <= parallel <= PARALLEL_MOST:
+             raise ValueError(f"--parallel: 1 to {PARALLEL_MOST} requests at once for GLM-5.3-Flash, not {parallel}")
+         self.parallel = parallel
++        if REPLAY_LEN and parallel > 1:
++            raise ValueError("--parallel: TF_GLM_KDA_REPLAY is single-stream only in this patch (the replay buffer "
++                             "holds one conversation's rows); run without --parallel or without TF_GLM_KDA_REPLAY")
+         self.spill_cfg = spill                # --spill-gib: a ``spill.SpillConfig`` (both ranks alike), else None
+         if spill is not None:                 # its write buffers pinned now, before the caches are sized
+             from tensorfold.cuda.spill import preallocate
+@@ -695,7 +715,7 @@
+             self.split.code() + [int(self.dump is not None), quant_code, self.shared, int(DRAFT_RING), int(self.mtp_on),
+                                  parallel, *verify_code, int(union_cover()), MAX_ROWS, len(WIDE_GRAPHS),
+                                  sum(WIDE_GRAPHS), max(WIDE_GRAPHS, default=0),
+-                                 KV_KINDS.index(kv), len(cfg.eos), sum(cfg.eos)]
++                                 KV_KINDS.index(kv), len(cfg.eos), sum(cfg.eos), REPLAY_LEN]
+         # other conversations' kept prompts get what the window leaves, at most TF_GLM_CACHE_GIB, the same on both ranks
+         plan = self.capacity_plan
+         wanted = int(float(os.environ.get("TF_GLM_CACHE_GIB", "3")) * 2 ** 30)
+@@ -713,6 +733,7 @@
+                                "TF_GLM_DRAFT_QUANT, TF_GLM_SHARED_PREFIX, TF_GLM_DRAFT_RING, TF_GLM_MTP, --parallel, "
+                                "TF_GLM_MULTI_VERIFY, TF_GLM_MULTI_SAMPLER / _DEPTH / _OVERHEAD_MS / _ASYNC / _LONE / _PROFILE / _WINDOW, "
+                                "TENSORFOLD_NUCLEUS_UNION, TF_GLM_MAX_ROWS, TF_GLM_WIDE_GRAPHS, TF_GLM_KV, TF_GLM_ASSISTANT_ENDS, "
++                               "TF_GLM_KDA_REPLAY / _LEN, "
+                                "TF_GLM_DRAFT_PRELAUNCH): "
+                                f"rank 0 {rows[0][:-1]}, " + ", ".join(f"rank {r} {rows[r][:-1]}" for r in odd) +
+                                "; pull the draft model on every machine (or pass --drafter none to all) and give "
+@@ -833,6 +854,10 @@
+         if rank == 0 and kda_chunked_on():
+             print("[tensorfold] TF_GLM_KDA_CHUNKED=1: KDA prompt chunks in chunked (WY) form, 32-row sub-chunks "
+                   "(close to the serial kernel, not its bits; decode keeps the serial kernel)", flush=True)
++        if rank == 0 and REPLAY_LEN:
++            print(f"[tensorfold] TF_GLM_KDA_REPLAY: KDA decode from a checkpoint plus a replay buffer of "
++                  f"{REPLAY_LEN} rows (a rejected draft's commit is a buffer-pointer move; every round's outputs "
++                  f"are the eager path's bits; single-stream only)", flush=True)
+         # rank 0: the role token whose first appearance ends a prompt's system block (a shared-prefix point)
+         self.opener = user_opener(model_dir) if self.shared and rank == 0 else None
+         if rank == 0 and self.shared:
+diff -r tensorfold/families/glm5_next/cuda/forward.py tensorfold/families/glm5_next/cuda/forward.py
+--- tensorfold/families/glm5_next/cuda/forward.py	2026-10-13 20:18:36.637297901 -0700
++++ tensorfold/families/glm5_next/cuda/forward.py	2026-10-13 20:15:33.542764297 -0700
+@@ -347,6 +347,16 @@
+         self.proj = sl.proj[slot]
+         self.scratch_set = sl.scratch[slot]
+         self.scratch = self.scratch_set.views if n else []
++        # TF_GLM_KDA_REPLAY: the checkpoint + replay buffer's planes (one conversation's, kda's cache, so a captured
++        # graph keeps their addresses): post-conv rows [layer, row, head, chan], rb_h the committed count (host) and
++        # rb_h_dev its device mirror the graph-captured kernels read, rb_idx the rows' offsets for the scatter
++        self.rb_h = 0
++        self.rb_k = self.rb_v = self.rb_g = self.rb_b = self.rb_h_dev = self.rb_idx = None
++        if kda_mod.REPLAY_LEN and n:
++            cap = kda_mod.REPLAY_LEN + rows
++            self.rb_k, self.rb_v, self.rb_g, self.rb_b, self.rb_h_dev = kda_mod.replay_planes(
++                n, w.cfg.lin_heads // w.world, cap, w.device)
++            self.rb_idx = torch.arange(cap, device=w.device)
+         self.latent = latent.ENABLED
+         self.mtp_len = 0
+         self.mtp_drafted = 0
+@@ -372,6 +382,13 @@
+         self.conv.zero_()
+         self.rec.zero_()
+         self.cur = [0] * len(self.cur)
++        if self.rb_k is not None:
++            self.rb_k.zero_()
++            self.rb_v.zero_()
++            self.rb_b.zero_()
++            self.rb_g.fill_(1.0)             # a neutral row (k = v = b = 0, g = 1) is update's identity
++            self.rb_h = 0
++            self.rb_h_dev.zero_()
+         self.set_pos(0)
+         self.set_mtp_len(0)
+         self.mtp_drafted = 0
+@@ -397,6 +414,10 @@
+         other.conv = self.conv.clone()
+         other.rec = self.rec.clone()
+         other.cur = list(self.cur)
++        if self.rb_k is not None:
++            other.rb_k, other.rb_v, other.rb_g, other.rb_b = (x.clone() for x in
++                                                              (self.rb_k, self.rb_v, self.rb_g, self.rb_b))
++            other.rb_h_dev, other.rb_h = self.rb_h_dev.clone(), self.rb_h
+         other.pos_dev = self.pos_dev.clone()
+         other.mtp_pos_dev = self.mtp_pos_dev.clone()
+         other.kc = [x.clone() for x in self.kc]
+@@ -519,12 +540,60 @@
+     else:
+         cur = st.cur[li]
+         with prof.timed("kda: recurrence"):
+-            out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
+-                                k.dt_bias, k.norm, c.eps, c.lower, R, st.scratch[li], st.rec[1 - cur, li])
++            if st.rb_k is not None:      # TF_GLM_KDA_REPLAY: checkpoint + buffer, no state write
++                out = _kda_replay(layer, w, st, b, R, li, cur, p)
++            else:
++                out = kda_mod.chain(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, st.rec[cur, li], k.a_log,
++                                    k.dt_bias, k.norm, c.eps, c.lower, R, st.scratch[li], st.rec[1 - cur, li])
+     with prof.timed("kda: out + all-gather"):
+         return out_proj(w, b, out, k.o, None if pre else qmm.group_sums(out, b.kxs[:R]), R, site=(layer.index, "a"))
+ 
+ 
++def _replay_neutral(st: State, h: int) -> None:
++    """Rows h.. of the replay buffer neutral again (k = v = b = 0, g = 1: update's identity), so the flush's fixed
++    L-row replay reads exactly the committed rows 0..h-1 whatever older rounds left there."""
++
++    for li in range(len(st.cur)):
++        st.rb_k[li][h:].zero_()
++        st.rb_v[li][h:].zero_()
++        st.rb_b[li][h:].zero_()
++        st.rb_g[li][h:].fill_(1.0)
++
++
++def _kda_replay(layer: LayerW, w: Weights, st: State, b: Buffers, R: int, li: int, cur: int,
++                p: torch.Tensor) -> torch.Tensor:
++    """The decode round's KDA on the checkpoint + replay buffer (TF_GLM_KDA_REPLAY). The wide prep stages the rows'
++    post-conv inputs (the wide scratch's saves, free while no step runs) and they scatter to buffer rows h..h+R at
++    the device h; when the window would overflow (h + R > L) the committed rows flush into the other parity's
++    checkpoint with a fixed L-row replay -- rows h..L-1 are neutral (``_replay_neutral``), so its bits are the serial
++    steps over rows 0..h-1 exactly -- then out_only reads the round's outputs from the checkpoint + buffer with no
++    state write (h from the device mirror, so a captured graph serves any h) and the wide path's out_kernel norms
++    the read-out. A rejected draft's commit is a buffer-pointer move (``commit``)."""
++
++    c = w.cfg
++    k = layer.kda
++    L = kda_mod.REPLAY_LEN
++    s = st.scratch[li]
++    flush = st.rb_h + R > L
++    q_tmp, y_tmp = kda_mod._wide_scratch(R, k.a_log.numel(), p.device)
++    with prof.timed("kda: prep"):
++        kda_mod.prep(p, k.b_off, b.ka[:R], b.kg[:R], st.conv[li], k.conv, k.a_log, k.dt_bias, c.lower, R,
++                     s.k[:R], s.v[:R], s.g[:R], s.b[:R], q_tmp[:R])
++    if flush:
++        kda_mod._ext().replay(st.rec[cur, li], st.rb_k[li][:L], st.rb_v[li][:L], st.rb_g[li][:L], st.rb_b[li][:L],
++                              L, st.rec[1 - cur, li])
++        st.rb_h_dev.zero_()
++    at = st.rb_idx[:R] + st.rb_h_dev   # the rows' places, on the device with h (graph-capturable)
++    st.rb_k[li].index_copy_(0, at, s.k[:R])
++    st.rb_v[li].index_copy_(0, at, s.v[:R])
++    st.rb_g[li].index_copy_(0, at, s.g[:R])
++    st.rb_b[li].index_copy_(0, at, s.b[:R])
++    kda_mod.out_only(st.rec[1 - cur if flush else cur, li], (st.rb_k[li], st.rb_v[li], st.rb_g[li], st.rb_b[li]),
++                     q_tmp[:R], st.rb_h_dev, R, y_tmp[:R].reshape(R, -1))
++    kda_mod.out_norm(y_tmp[:R].reshape(R, -1), b.kg[:R], b.kg.stride(0), k.norm, c.eps, s.out[:R])
++    return s.out[:R]
++
++
+ def _scratch_rows(s, lo: int):
+     """A prompt buffer's KDA scratch from row ``lo`` on (the same storage)."""
+ 
+@@ -1133,6 +1202,24 @@
+ 
+     if not 1 <= keep <= R or (b.prefill and keep != R):
+         raise ValueError("keep must be in 1..R, and all of a prompt chunk")
++    if st.rb_k is not None:                  # TF_GLM_KDA_REPLAY
++        if b.prefill:                        # a prompt chunk commits eagerly (the chain): the buffer restarts
++            st.rb_h = 0
++            st.rb_h_dev.zero_()
++            _replay_neutral(st, 0)
++        else:
++            # the round left the states where they are (no replay_layers, no parity flip): the kept rows stay in the
++            # buffer, so a rejected draft was a pointer move, and a flush's checkpoint move is replayed by the same
++            # rule kda_block used; rows past the new h go neutral again for the next flush's fixed L-row replay
++            flushed = st.rb_h + R > kda_mod.REPLAY_LEN
++            st.rb_h = keep if flushed else st.rb_h + keep
++            _replay_neutral(st, st.rb_h)
++            st.rb_h_dev.fill_(st.rb_h)
++            if flushed:
++                st.cur = [1 - c for c in st.cur]
++            _shift_conv(st.conv, st.proj, keep)
++            st.set_pos(st.pos + keep)
++            return
+     n = 0 if b.prefill else len(st.cur)
+     if n:
+         cur = st.cur[0]
+diff -r tensorfold/families/glm5_next/cuda/graphs.py tensorfold/families/glm5_next/cuda/graphs.py
+--- tensorfold/families/glm5_next/cuda/graphs.py	2026-10-13 20:18:34.889010142 -0700
++++ tensorfold/families/glm5_next/cuda/graphs.py	2026-10-13 20:15:33.543500796 -0700
+@@ -21,25 +21,32 @@
+ class Graphs:
+     def __init__(self, e, main_rows=(1, 2, 3, 4), mtp_rows=(1, 2, 3, 4)) -> None:
+         self.pool = torch.cuda.graph_pool_handle()
+-        self.main: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}
++        self.main: dict[tuple, torch.cuda.CUDAGraph] = {}
+         self.mtp: dict[int, torch.cuda.CUDAGraph] = {}
+-        self.sparse: dict[tuple[int, int, int], torch.cuda.CUDAGraph] = {}      # (rows, parity, pool bucket)
++        self.sparse: dict[tuple, torch.cuda.CUDAGraph] = {}      # (rows, parity[, flush], pool bucket)
+         self.sparse_mtp: dict[tuple[int, int], torch.cuda.CUDAGraph] = {}       # (rows, pool bucket)
+         w, st = e.w, e.st
+         prof.active = False
++        from . import kda as kda_mod
++
++        replay = bool(kda_mod.REPLAY_LEN) and st.rb_k is not None
++        L = kda_mod.REPLAY_LEN
+         saved = list(st.cur)
+         parities = (0, 1) if st.cur else (0,)
+         with torch.no_grad():
+             for R in main_rows:
+                 for parity in parities:
+                     st.cur = [parity] * len(st.cur)
+-                    for _ in range(2):
+-                        compute(w, st, e.buf, R)
+-                    torch.cuda.synchronize()
+-                    g = torch.cuda.CUDAGraph()
+-                    with torch.cuda.graph(g, pool=self.pool):
+-                        compute(w, st, e.buf, R)
+-                    self.main[(R, parity)] = g
++                    for flush in _flushes(replay, R, L):
++                        for _ in range(2):
++                            _set_h(st, L, flush)
++                            compute(w, st, e.buf, R)
++                        torch.cuda.synchronize()
++                        g = torch.cuda.CUDAGraph()
++                        _set_h(st, L, flush)     # the runs above left the mirror at a flush's 0
++                        with torch.cuda.graph(g, pool=self.pool):
++                            compute(w, st, e.buf, R)
++                        self.main[(R, parity) + ((flush,) if replay else ())] = g
+             st.cur = saved
+             if w.mtp is not None:
+                 e.mbuf.zero_first = False
+@@ -52,10 +59,10 @@
+                         mtp_compute(w, st, e.mbuf, n)
+                     self.mtp[n] = g
+             if st.index is not None and latent.ENABLED:
+-                self._capture_sparse(e, main_rows, mtp_rows, parities)
++                self._capture_sparse(e, main_rows, parities, replay, L)
+         torch.cuda.synchronize()
+ 
+-    def _capture_sparse(self, e, main_rows, mtp_rows, parities) -> None:
++    def _capture_sparse(self, e, main_rows, parities, replay, L) -> None:
+         w, st = e.w, e.st
+         np_max = st.index[0][2].shape[0] - 2
+         saved = list(st.cur)
+@@ -63,13 +70,16 @@
+             for R in main_rows:
+                 for parity in parities:
+                     st.cur = [parity] * len(st.cur)
+-                    for _ in range(2):
+-                        compute(w, st, e.buf, R, sparse_np=bucket)
+-                    torch.cuda.synchronize()
+-                    g = torch.cuda.CUDAGraph()
+-                    with torch.cuda.graph(g, pool=self.pool):
+-                        compute(w, st, e.buf, R, sparse_np=bucket)
+-                    self.sparse[(R, parity, bucket)] = g
++                    for flush in _flushes(replay, R, L):
++                        for _ in range(2):
++                            _set_h(st, L, flush)
++                            compute(w, st, e.buf, R, sparse_np=bucket)
++                        torch.cuda.synchronize()
++                        g = torch.cuda.CUDAGraph()
++                        _set_h(st, L, flush)
++                        with torch.cuda.graph(g, pool=self.pool):
++                            compute(w, st, e.buf, R, sparse_np=bucket)
++                        self.sparse[(R, parity) + ((flush,) if replay else ()) + (bucket,)] = g
+             if w.mtp is not None:
+                 for n in mtp_rows:
+                     for _ in range(2):
+@@ -80,3 +90,21 @@
+                         mtp_compute(w, st, e.mbuf, n, sparse_np=bucket)
+                     self.sparse_mtp[(n, bucket)] = g
+         st.cur = saved
++
++
++def _flushes(replay: bool, R: int, L: int) -> tuple:
++    """The flush values a window of R rows is captured for: both when a round can avoid the flush (R <= L), only the
++    flush past that; the key carries no dim when REPLAY is off."""
++
++    if not replay:
++        return (False,)
++    return (False, True) if R <= L else (True,)
++
++
++def _set_h(st, L: int, flush: bool) -> None:
++    """The committed count a (R, flush) capture assumes: L forces the flush branch, 0 the plain one (the runs leave
++    the mirror at a flush's 0, so set it before each one; the captured kernels read h from the device)."""
++
++    st.rb_h = L if flush else 0
++    if st.rb_h_dev is not None:
++        st.rb_h_dev.fill_(st.rb_h)
+diff -r tensorfold/families/glm5_next/cuda/kda.cpp tensorfold/families/glm5_next/cuda/kda.cpp
+--- tensorfold/families/glm5_next/cuda/kda.cpp	2026-10-13 20:18:35.375315433 -0700
++++ tensorfold/families/glm5_next/cuda/kda.cpp	2026-10-13 20:15:33.544107379 -0700
+@@ -22,6 +22,15 @@
+ void kda_replay_layers_segments_cuda(const at::Tensor&, int64_t, at::Tensor&, int64_t, int64_t, int64_t,
+                                      const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
+                                      int64_t, int64_t, int64_t, int64_t);
++void kda_out_only_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                       const at::Tensor&, const at::Tensor&, const at::Tensor&, int64_t, at::Tensor&);
++void kda_out_norm_cuda(const at::Tensor&, const at::Tensor&, int64_t, const at::Tensor&, double, at::Tensor&);
++void kda_prep_cuda(const at::Tensor&, int64_t, int64_t, const at::Tensor&, int64_t, const at::Tensor&,
++                   const at::Tensor&, const at::Tensor&, const at::Tensor&, double, int64_t, at::Tensor&,
++                   at::Tensor&, at::Tensor&, at::Tensor&, at::Tensor&);
++void kda_out_only_seg_cuda(const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                           const at::Tensor&, const at::Tensor&, const at::Tensor&, const at::Tensor&,
++                           at::Tensor&);
+ 
+ static void check(const at::Tensor& x, at::ScalarType t, const char* name) {
+     TORCH_CHECK(x.is_cuda() && x.scalar_type() == t, name, ": expected a CUDA tensor of the right dtype");
+@@ -172,6 +181,123 @@
+                                     v_save, g_save, b_save, kv_stride, b_stride, layers, heads);
+ }
+ 
++// state_in [H, 128, 128] read-only; the buffer slices k/g [cap, H, 128] fp32, v [cap, H, 128] bf16, b [cap, H]
++// fp32 (rows 0..h-1 committed, the round's ``rows`` rows follow); q_in [rows, H, 128] the normalized q; y_out
++// [rows, H * 128] the pre-norm read-out for out_kernel. The committed count lives on the device (h_dev int32[1],
++// read by the kernel for graph capture), so the caller keeps h + rows within the buffer's cap.
++void out_only(const at::Tensor& state_in, const at::Tensor& k, const at::Tensor& v, const at::Tensor& g,
++              const at::Tensor& b, const at::Tensor& q_in, const at::Tensor& h_dev, int64_t rows,
++              at::Tensor y_out) {
++    check(state_in, at::kFloat, "state");
++    check(k, at::kFloat, "k");
++    check(v, at::kBFloat16, "v");
++    check(g, at::kFloat, "g");
++    check(b, at::kFloat, "beta");
++    check(q_in, at::kFloat, "q");
++    check(y_out, at::kBFloat16, "read-out");
++    check(h_dev, at::kInt, "h");
++    TORCH_CHECK(state_in.dim() == 3 && state_in.size(1) == 128 && state_in.size(2) == 128 &&
++                state_in.is_contiguous(), "state must be [H, 128, 128] contiguous");
++    const int64_t H = state_in.size(0);
++    TORCH_CHECK(k.is_contiguous() && v.is_contiguous() && g.is_contiguous() && b.is_contiguous() &&
++                q_in.is_contiguous() && y_out.is_contiguous() && h_dev.is_contiguous(),
++                "buffers, q, read-out and h must be contiguous");
++    TORCH_CHECK(k.dim() == 3 && k.size(1) == H && k.size(2) == 128 && g.sizes() == k.sizes(),
++                "k/g must be [cap, H, 128]");
++    TORCH_CHECK(v.dim() == 3 && v.size(1) == H && v.size(2) == 128, "v must be [cap, H, 128]");
++    TORCH_CHECK(b.dim() == 2 && b.size(1) == H, "beta must be [cap, H]");
++    TORCH_CHECK(h_dev.numel() == 1, "h: a device int32[1] mirror of the committed count");
++    TORCH_CHECK(rows >= 1 && q_in.dim() == 3 && q_in.size(0) >= rows && q_in.size(1) == H && q_in.size(2) == 128,
++                "q must be [rows, H, 128] with rows >= 1");
++    TORCH_CHECK(y_out.numel() >= rows * H * 128, "read-out rows");
++    c10::cuda::CUDAGuard guard(state_in.device());
++    kda_out_only_cuda(state_in, k, v, g, b, q_in, h_dev, rows, y_out);
++}
++
++// Segment form of out_only for the multi-stream pool: the planes k/g/v/b are [conversations, H, cap, chan] with
++// one committed count h_devs[conversation] per conversation, read-only rec [slots, 2, H, 128, 128]; segment i
++// reads conversation seg[SEG_SLOT] and writes its rows' read-out at the stream's window rows row0 .. of the
++// shared wide scratch.
++void out_only_seg(const at::Tensor& seg, const at::Tensor& rec, const at::Tensor& k, const at::Tensor& v,
++                  const at::Tensor& g, const at::Tensor& b, const at::Tensor& q_in, const at::Tensor& h_devs,
++                  at::Tensor y_out) {
++    check_segments(seg);
++    check(rec, at::kFloat, "state");
++    check(k, at::kFloat, "k");
++    check(v, at::kBFloat16, "v");
++    check(g, at::kFloat, "g");
++    check(b, at::kFloat, "beta");
++    check(q_in, at::kFloat, "q");
++    check(y_out, at::kBFloat16, "read-out");
++    check(h_devs, at::kInt, "h");
++    TORCH_CHECK(rec.dim() == 5 && rec.size(1) == 2 && rec.size(2) >= 1 && rec.size(3) == 128 && rec.size(4) == 128 &&
++                rec.stride(4) == 1 && rec.stride(3) == 128 && rec.stride(2) == 128 * 128,
++                "state [slots, 2, H, 128, 128], each [H, 128, 128] contiguous");
++    const int64_t H = rec.size(2);
++    TORCH_CHECK(k.is_contiguous() && v.is_contiguous() && g.is_contiguous() && b.is_contiguous() &&
++                q_in.is_contiguous() && y_out.is_contiguous() && h_devs.is_contiguous(),
++                "buffers, q, read-out and h must be contiguous");
++    TORCH_CHECK(k.dim() == 4 && k.size(1) == H && k.size(3) == 128 && g.sizes() == k.sizes(),
++                "k/g must be [conversations, H, cap, 128]");
++    TORCH_CHECK(v.dim() == 4 && v.size(1) == H && v.size(3) == 128, "v must be [conversations, H, cap, 128]");
++    TORCH_CHECK(b.dim() == 3 && b.size(1) == H, "beta must be [conversations, H, cap]");
++    TORCH_CHECK(h_devs.numel() == k.size(0), "h: one committed count per conversation");
++    TORCH_CHECK(q_in.dim() == 3 && q_in.size(1) == H && q_in.size(2) == 128, "q must be [rows, H, 128]");
++    TORCH_CHECK(y_out.numel() >= q_in.size(0) * H * 128, "read-out rows");
++    c10::cuda::CUDAGuard guard(rec.device());
++    kda_out_only_seg_cuda(seg, rec, k, v, g, b, q_in, h_devs, y_out);
++}
++
++// chain_wide's prep stage alone: the same conv + SiLU, decays, beta and q/k norms (the same bits) for rows the
++// delta rule does not run on yet -- a decode round writes its post-conv rows into arbitrary per-layer buffer
++// slices (k_out/g_out [rows, H, 128] fp32, v_out [rows, H, 128] bf16, b_out [rows, H] fp32) and the normalized
++// q into the wide scratch's q_tmp.
++void prep(const at::Tensor& P, int64_t p_stride, int64_t b_off, const at::Tensor& A, int64_t a_stride,
++          const at::Tensor& cs, const at::Tensor& cw, const at::Tensor& a_log, const at::Tensor& dt_bias,
++          double lower, int64_t rows, at::Tensor q_out, at::Tensor k_out, at::Tensor v_out, at::Tensor g_out,
++          at::Tensor b_out) {
++    check(P, at::kBFloat16, "P");
++    check(A, at::kBFloat16, "A");
++    check(cs, at::kBFloat16, "conv state");
++    check(cw, at::kBFloat16, "conv weight");
++    check(a_log, at::kFloat, "A_log");
++    check(dt_bias, at::kFloat, "dt_bias");
++    check(k_out, at::kFloat, "k");
++    check(v_out, at::kBFloat16, "v");
++    check(g_out, at::kFloat, "g");
++    check(b_out, at::kFloat, "beta");
++    check(q_out, at::kFloat, "q scratch");
++    const int64_t H = a_log.numel();
++    TORCH_CHECK(cs.is_contiguous() && cw.is_contiguous(), "conv state and conv weight must be contiguous");
++    TORCH_CHECK(dt_bias.numel() == H * 128, "dt_bias [H*128]");
++    TORCH_CHECK(cw.size(0) == 3 * H * 128 && cw.size(1) == 4, "conv weight [3*H*128, 4]");
++    TORCH_CHECK(rows >= 1 && P.size(0) >= rows, "rows");
++    TORCH_CHECK(k_out.numel() >= rows * H * 128 && v_out.numel() >= rows * H * 128 &&
++                g_out.numel() >= rows * H * 128 && b_out.numel() >= rows * H && q_out.numel() >= rows * H * 128,
++                "scratch rows");
++    c10::cuda::CUDAGuard guard(P.device());
++    kda_prep_cuda(P, p_stride, b_off, A, a_stride, cs, cw, a_log, dt_bias, lower, rows, q_out, k_out, v_out,
++                  g_out, b_out);
++}
++
++// out_kernel alone: the gated RMSNorm epilogue, chain_wide's third stage (its exact bits) for a read-out the
++// delta rule did not produce -- out_only's y_out. y_in/out [rows, H * 128] bf16, gate the bf16 gate rows
++// (b.kg) with row stride ``g_stride``; H comes from out's row width.
++void out_norm(const at::Tensor& y_in, const at::Tensor& gate, int64_t g_stride, const at::Tensor& norm_w,
++              double eps, at::Tensor out) {
++    check(y_in, at::kBFloat16, "read-out");
++    check(gate, at::kBFloat16, "gate");
++    check(norm_w, at::kBFloat16, "norm");
++    check(out, at::kBFloat16, "out");
++    TORCH_CHECK(out.dim() == 2 && out.size(1) % 128 == 0 && out.is_contiguous() && y_in.sizes() == out.sizes() &&
++                y_in.is_contiguous(), "read-out and out must be contiguous [rows, H * 128] of the same shape");
++    const int64_t H = out.size(1) / 128;
++    TORCH_CHECK(norm_w.numel() == 128 && norm_w.is_contiguous(), "norm [128]");
++    TORCH_CHECK(out.size(0) >= 1 && gate.dim() == 2 && gate.size(0) >= out.size(0), "rows");
++    c10::cuda::CUDAGuard guard(out.device());
++    kda_out_norm_cuda(y_in, gate, g_stride, norm_w, eps, out);
++}
++
+ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+     m.def("chain", &chain);
+     m.def("chain_wide", &chain_wide);
+@@ -179,4 +305,8 @@
+     m.def("replay_layers", &replay_layers);
+     m.def("chain_wide_segments", &chain_wide_segments);
+     m.def("replay_layers_segments", &replay_layers_segments);
++    m.def("out_only", &out_only);
++    m.def("out_only_seg", &out_only_seg);
++    m.def("out_norm", &out_norm);
++    m.def("prep", &prep);
+ }
+diff -r tensorfold/families/glm5_next/cuda/kda.cu tensorfold/families/glm5_next/cuda/kda.cu
+--- tensorfold/families/glm5_next/cuda/kda.cu	2026-10-13 20:18:35.375933724 -0700
++++ tensorfold/families/glm5_next/cuda/kda.cu	2026-10-13 20:15:33.544914878 -0700
+@@ -7,7 +7,9 @@
+ // read-out rounded to bf16; then the gated RMSNorm bf16(w * (y * rsqrt(mean(y^2) + eps)) * sigmoid(gate)).
+ // Warp w owns value rows 4w .. 4w + 3, lane l the key columns 4l .. 4l + 3. The state update is one routine
+ // (``update``) shared with ``replay``, compiled without FMA contraction, so a replayed prefix of a window gives
+-// the bits of the serial steps.
++// the bits of the serial steps. ``out_only`` (and its segment form) run that ``update`` over a checkpoint plus
++// the replay buffer's saved rows on registers alone and read out the round's rows: the bits of ``chain``, with
++// no state write.
+ 
+ #include <ATen/ATen.h>
+ #include <ATen/cuda/CUDAContext.h>
+@@ -352,6 +354,54 @@
+     out[(size_t)r * H * DV + h * DV + t] = __float2bfloat16_rn(yw * sigmoidf_(gate));
+ }
+ 
++// Decode outputs from a checkpoint and the replay buffer without touching the state: rows 0..h0 - 1 of the
++// buffer are committed, the round's ``rows`` rows follow, and the kernel runs the same ``update`` over all
++// h0 + rows saved rows on a register copy of the checkpoint (replay_kernel's loop) but only reads out the rows
++// h0..h0 + rows - 1 with their normalized q (step_kernel's read-out, y_out [rows, H * DV]). So a non-flush
++// round's outputs are the bits of ``chain``'s rows h0..h0 + rows - 1 -- no new summation order, no gamma
++// products to underflow -- and the state is neither read-modified nor written. h0 comes from the device mirror
++// h_dev[0] (graph-safe); the caller keeps h0 + rows within the buffer's cap.
++__global__ void __launch_bounds__(1024) out_only_kernel(
++        int H, const float* __restrict__ state_in, const float* __restrict__ k_save,
++        const __nv_bfloat16* __restrict__ v_save, const float* __restrict__ g_save,
++        const float* __restrict__ b_save, const float* __restrict__ q_in, const int* __restrict__ h_dev,
++        int rows, __nv_bfloat16* __restrict__ y_out) {
++    const int h = blockIdx.x;
++    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
++    __shared__ float vs[DV];
++    const int h0 = h_dev[0];
++    float s[4][4];
++    const size_t sbase = (size_t)h * DV * DK;
++#pragma unroll
++    for (int j = 0; j < 4; ++j)
++#pragma unroll
++        for (int i = 0; i < 4; ++i) s[j][i] = state_in[sbase + (size_t)(warp * 4 + j) * DK + lane * 4 + i];
++    for (int r = 0; r < h0 + rows; ++r) {
++        const size_t base = ((size_t)r * H + h) * DK;
++        if (t < DV) vs[t] = __bfloat162float(v_save[base + t]);
++        __syncthreads();
++        float kk[4], gg[4];
++#pragma unroll
++        for (int i = 0; i < 4; ++i) { kk[i] = k_save[base + lane * 4 + i]; gg[i] = g_save[base + lane * 4 + i]; }
++        update(s, kk, gg, vs, warp, b_save[r * H + h]);
++        if (r >= h0) {
++            const int sr = r - h0;
++            float qq[4];
++#pragma unroll
++            for (int i = 0; i < 4; ++i) qq[i] = q_in[((size_t)sr * H + h) * DK + lane * 4 + i];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                float o = 0.0f;
++#pragma unroll
++                for (int i = 0; i < 4; ++i) o = o + s[j][i] * qq[i];
++                o = warp_sum(o);
++                if (lane == 0) y_out[((size_t)sr * H + h) * DV + warp * 4 + j] = __float2bfloat16_rn(o);
++            }
++        }
++        __syncthreads();
++    }
++}
++
+ // Several streams' windows in one launch. A segment table (int32 [nseg, SEG_COLS]: first row, rows, state slot,
+ // parity, conv slot, keep) cuts the window's rows into streams; each segment reads its conv taps from its own
+ // conv slot and runs the recurrence from rec[slot, parity] into rec[slot, 1 - parity]. Per row the arithmetic is
+@@ -485,6 +535,56 @@
+         for (int i = 0; i < 4; ++i) state_out[sbase + (size_t)(warp * 4 + j) * DK + lane * 4 + i] = s[j][i];
+ }
+ 
++// out_only for several streams' rows in one window: block (segment, head). The segment's SEG_SLOT names the
++// conversation -- its buffer rows in the pool planes [conversations, H, cap, chan] and its committed count in
++// h_devs[slot] -- and rec[slot, parity] is read only. Buffer row r of the conversation is window row
++// row0 + r - h0, so the q rows and the read-out land at the stream's window rows like step_seg_kernel's. The
++// per-row arithmetic is out_only's line for line: a segment's bits are its solo run's.
++__global__ void __launch_bounds__(1024) out_only_seg_kernel(
++        int H, const int* __restrict__ seg, const float* __restrict__ rec, size_t slot_stride,
++        size_t parity_stride, const float* __restrict__ k_save, const __nv_bfloat16* __restrict__ v_save,
++        const float* __restrict__ g_save, const float* __restrict__ b_save, const float* __restrict__ q_in,
++        const int* __restrict__ h_devs, int cap, __nv_bfloat16* __restrict__ y_out) {
++    const int* e = seg + (blockIdx.x / H) * SEG_COLS;
++    const int row0 = e[SEG_ROW0], rows = e[SEG_ROWS], slot = e[SEG_SLOT], parity = e[SEG_PARITY];
++    if (rows <= 0) return;
++    const int h = blockIdx.x % H;
++    const int h0 = h_devs[slot];
++    const float* state_in = rec + (size_t)slot * slot_stride + (size_t)parity * parity_stride;
++    const int t = threadIdx.x, warp = t >> 5, lane = t & 31;
++    __shared__ float vs[DV];
++    float s[4][4];
++    const size_t sbase = (size_t)h * DV * DK;
++#pragma unroll
++    for (int j = 0; j < 4; ++j)
++#pragma unroll
++        for (int i = 0; i < 4; ++i) s[j][i] = state_in[sbase + (size_t)(warp * 4 + j) * DK + lane * 4 + i];
++    for (int r = 0; r < h0 + rows; ++r) {
++        const size_t base = (((size_t)slot * H + h) * cap + r) * DK;
++        if (t < DV) vs[t] = __bfloat162float(v_save[base + t]);
++        __syncthreads();
++        float kk[4], gg[4];
++#pragma unroll
++        for (int i = 0; i < 4; ++i) { kk[i] = k_save[base + lane * 4 + i]; gg[i] = g_save[base + lane * 4 + i]; }
++        update(s, kk, gg, vs, warp, b_save[((size_t)slot * H + h) * cap + r]);
++        if (r >= h0) {
++            const int wr = row0 + (r - h0);
++            float qq[4];
++#pragma unroll
++            for (int i = 0; i < 4; ++i) qq[i] = q_in[((size_t)wr * H + h) * DK + lane * 4 + i];
++#pragma unroll
++            for (int j = 0; j < 4; ++j) {
++                float o = 0.0f;
++#pragma unroll
++                for (int i = 0; i < 4; ++i) o = o + s[j][i] * qq[i];
++                o = warp_sum(o);
++                if (lane == 0) y_out[((size_t)wr * H + h) * DV + warp * 4 + j] = __float2bfloat16_rn(o);
++            }
++        }
++        __syncthreads();
++    }
++}
++
+ // replay_layers_kernel for block (segment, layer, head): the segment's first ``keep`` rows from rec[slot, parity]
+ // into rec[slot, 1 - parity]; keep == rows (the chain already left that state) or rows == 0 skips the segment.
+ __global__ void __launch_bounds__(1024) replay_layers_seg_kernel(
+@@ -632,3 +732,55 @@
+         (size_t)kv_stride, (size_t)b_stride);
+     C10_CUDA_KERNEL_LAUNCH_CHECK();
+ }
++
++// prep_kernel alone: chain_wide's prep stage for rows the delta rule does not run on yet -- a decode round
++// writes its post-conv rows into arbitrary per-layer buffer slices (the replay buffer's rb_k/rb_v/rb_g/rb_b)
++// plus the normalized q into the wide scratch. Same bits as chain_wide's prep stage.
++void kda_prep_cuda(const at::Tensor& P, int64_t p_stride, int64_t b_off, const at::Tensor& A, int64_t a_stride,
++                   const at::Tensor& cs, const at::Tensor& cw, const at::Tensor& a_log, const at::Tensor& dt_bias,
++                   double lower, int64_t rows, at::Tensor& q_out, at::Tensor& k_out, at::Tensor& v_out,
++                   at::Tensor& g_out, at::Tensor& b_out) {
++    auto stream = at::cuda::getCurrentCUDAStream();
++    const int H = (int)a_log.numel();
++    const dim3 grid((unsigned)rows, (unsigned)H);
++    prep_kernel<<<grid, 512, 0, stream>>>(
++        H, ptr<__nv_bfloat16>(P), (int)p_stride, (int)b_off, ptr<__nv_bfloat16>(A), (int)a_stride,
++        ptr<__nv_bfloat16>(cs), ptr<__nv_bfloat16>(cw), ptr<float>(a_log), ptr<float>(dt_bias), (float)lower,
++        ptr<float>(q_out), ptr<float>(k_out), ptr<__nv_bfloat16>(v_out), ptr<float>(g_out), ptr<float>(b_out));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++void kda_out_only_cuda(const at::Tensor& state_in, const at::Tensor& k, const at::Tensor& v, const at::Tensor& g,
++                       const at::Tensor& b, const at::Tensor& q_in, const at::Tensor& h_dev, int64_t rows,
++                       at::Tensor& y_out) {
++    auto stream = at::cuda::getCurrentCUDAStream();
++    const int H = (int)state_in.size(0);
++    out_only_kernel<<<H, 1024, 0, stream>>>(H, ptr<float>(state_in), ptr<float>(k), ptr<__nv_bfloat16>(v),
++                                            ptr<float>(g), ptr<float>(b), ptr<float>(q_in), ptr<int>(h_dev),
++                                            (int)rows, ptr<__nv_bfloat16>(y_out));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++// out_kernel alone: the gated RMSNorm epilogue, chain_wide's third stage for a read-out the delta rule did not
++// produce (out_only's y_out). H comes from the row width of out [rows, H * 128].
++void kda_out_norm_cuda(const at::Tensor& y_in, const at::Tensor& gate, int64_t g_stride, const at::Tensor& norm_w,
++                       double eps, at::Tensor& out) {
++    auto stream = at::cuda::getCurrentCUDAStream();
++    const dim3 grid((unsigned)out.size(0), (unsigned)(out.size(1) / DV));
++    out_kernel<<<grid, DV, 0, stream>>>((int)(out.size(1) / DV), ptr<__nv_bfloat16>(y_in), ptr<__nv_bfloat16>(gate),
++                                        (int)g_stride, ptr<__nv_bfloat16>(norm_w), (float)eps,
++                                        ptr<__nv_bfloat16>(out));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
++
++void kda_out_only_seg_cuda(const at::Tensor& seg, const at::Tensor& rec, const at::Tensor& k, const at::Tensor& v,
++                           const at::Tensor& g, const at::Tensor& b, const at::Tensor& q_in,
++                           const at::Tensor& h_devs, at::Tensor& y_out) {
++    auto stream = at::cuda::getCurrentCUDAStream();
++    const int H = (int)rec.size(2), nseg = (int)seg.size(0);
++    out_only_seg_kernel<<<(unsigned)(nseg * H), 1024, 0, stream>>>(
++        H, ptr<int>(seg), ptr<float>(rec), (size_t)rec.stride(0), (size_t)rec.stride(1), ptr<float>(k),
++        ptr<__nv_bfloat16>(v), ptr<float>(g), ptr<float>(b), ptr<float>(q_in), ptr<int>(h_devs), (int)k.size(2),
++        ptr<__nv_bfloat16>(y_out));
++    C10_CUDA_KERNEL_LAUNCH_CHECK();
++}
+diff -r tensorfold/families/glm5_next/cuda/kda.py tensorfold/families/glm5_next/cuda/kda.py
+--- tensorfold/families/glm5_next/cuda/kda.py	2026-10-13 20:18:35.600911764 -0700
++++ tensorfold/families/glm5_next/cuda/kda.py	2026-10-13 20:15:33.545342003 -0700
+@@ -1,4 +1,4 @@
+-"""Fused KDA chains and prefix replay use the same state update routine so a kept prefix preserves serial bits."""
++"""Fused KDA chains and prefix replay use the same state update routine so a kept prefix preserves serial bits, and ``out_only`` reads a decode round's outputs from the checkpoint plus its buffer rows with those bits."""
+ 
+ from __future__ import annotations
+ 
+@@ -16,7 +16,7 @@
+     from tensorfold.cuda.build import load
+ 
+     here = Path(__file__).parent
+-    return load(name="tensorfold_glm_kda_v2", sources=[str(here / "kda.cpp"), str(here / "kda.cu")],
++    return load(name="tensorfold_glm_kda_v3", sources=[str(here / "kda.cpp"), str(here / "kda.cu")],
+                 extra_cuda_cflags=["-O3", "--fmad=false"], verbose=False)
+ 
+ 
+@@ -176,3 +176,90 @@
+     L, H = scratch.layers, scratch.heads
+     _ext().replay_layers_segments(seg, rec, scratch.k, scratch.v, scratch.g, scratch.b, scratch.rows * H * DK,
+                                   scratch.rows * H, L, H)
++
++
++# -- checkpoint + replay buffer (ReplaySSM) --------------------------------------------------------------------
++# Decode rounds write their post-conv rows into a per-State buffer (the wide prep with buffer slices) and read
++# the outputs from the checkpoint plus the buffer (out_only): no state write, so a speculative rollback is a
++# buffer-pointer move and commit does not re-run replay_layers. When the buffer would overflow the window L, the
++# committed rows flush through replay (the exact bits of the serial steps) and the round's rows compact to the
++# front. Single-stream only in this patch.
++REPLAY_LEN = int(os.environ.get("TF_GLM_KDA_REPLAY_LEN", "0"))  # 0 = off; else the window L
++_rb: dict = {}
++
++
++def _replay_planes(layers: int, heads: int, cap: int, device) -> tuple:
++    """The buffer planes [layers, cap, heads, chan] and the int32[1] h mirror, cached per device so engine
++    startup's reserve and the State share one allocation (a captured graph keeps the addresses it captured)."""
++    device = torch.device(device)
++    if device.type == "cuda" and device.index is None:
++        device = torch.device("cuda", torch.cuda.current_device())
++    key = (layers, heads, cap, device)
++    planes = _rb.get(key)
++    if planes is None:
++        planes = (torch.empty((layers, cap, heads, DK), dtype=torch.float32, device=device),
++                  torch.empty((layers, cap, heads, DV), dtype=torch.bfloat16, device=device),
++                  torch.empty((layers, cap, heads, DK), dtype=torch.float32, device=device),
++                  torch.empty((layers, cap, heads), dtype=torch.float32, device=device),
++                  torch.zeros((1,), dtype=torch.int32, device=device))
++        _rb[key] = planes
++    return planes
++
++
++def replay_planes(layers: int, heads: int, cap: int, device) -> tuple:
++    """The cached buffer planes (k, v, g, b, h_dev) for a State's ``reset``/decode use; ``reserve_replay``
++    allocates them before any CUDA graph is captured."""
++
++    return _replay_planes(layers, heads, cap, device)
++
++
++def reserve_replay(layers: int, heads: int, cap: int, device) -> None:
++    """The replay buffer for ``cap`` rows per layer, allocated now (before graph capture)."""
++
++    _replay_planes(layers, heads, cap, device)
++
++
++def prep(p: torch.Tensor, b_off: int, a: torch.Tensor, g: torch.Tensor, conv_state: torch.Tensor,
++         conv_w: torch.Tensor, a_log: torch.Tensor, dt_bias: torch.Tensor, lower: float, rows: int,
++         k_out: torch.Tensor, v_out: torch.Tensor, g_out: torch.Tensor, b_out: torch.Tensor,
++         q_out: torch.Tensor) -> None:
++    """chain_wide's prep stage alone (the same conv + SiLU, decays, beta and q/k norms, the same bits) for rows
++    the delta rule does not run on yet: a decode round writes its post-conv rows into arbitrary per-layer buffer
++    slices -- k_out/g_out [rows, H, 128] fp32, v_out [rows, H, 128] bf16, b_out [rows, H] fp32 -- and the
++    normalized q into the wide scratch's q_tmp."""
++
++    _ext().prep(p, p.stride(0), int(b_off), a, a.stride(0), conv_state, conv_w, a_log, dt_bias, float(lower),
++                int(rows), q_out, k_out, v_out, g_out, b_out)
++
++
++def out_only(state_in: torch.Tensor, buf: tuple, q_in: torch.Tensor, h_dev: torch.Tensor, rows: int,
++             y_out: torch.Tensor) -> None:
++    """Decode outputs from the checkpoint + buffer with no state write: the bits of ``chain``'s rows h..h+rows-1
++    (the same ``update`` and read-out on the saved k/v/g/b, not a new summation order), so a non-flush round
++    changes nothing but the buffer. buf = (k, v, g, b) this layer's slices [cap, H, 128] / [cap, H]; q_in the
++    normalized q [rows, H, 128]; h_dev int32[1] the committed count (read on the device, graph-safe; the caller
++    keeps h + rows within the buffer's cap); y_out [rows, H * 128] the pre-norm read-out for ``out_kernel``."""
++
++    k, v, g, b = buf
++    _ext().out_only(state_in, k, v, g, b, q_in, h_dev, int(rows), y_out)
++
++
++def out_norm(y_in: torch.Tensor, gate: torch.Tensor, gate_stride: int, norm_w: torch.Tensor, eps: float,
++             out: torch.Tensor) -> None:
++    """out_kernel alone (the gated RMSNorm epilogue, chain_wide's third stage, its exact bits) for a read-out
++    the delta rule did not produce -- out_only's y_out: y_in [rows, H * 128] bf16 (e.g. the wide scratch's y
++    pair reshaped to 2-D), gate the bf16 gate rows (b.kg) with row stride ``gate_stride``, out [rows, H * 128]
++    bf16; H comes from the row width."""
++
++    _ext().out_norm(y_in, gate, int(gate_stride), norm_w, float(eps), out)
++
++
++def out_only_seg(seg: torch.Tensor, rec: torch.Tensor, buf: tuple, h_devs: torch.Tensor, q_in: torch.Tensor,
++                 y_out: torch.Tensor) -> None:
++    """``out_only`` for several streams' rows in one window (``segment_table``): segment i reads conversation
++    seg[i, SEG_SLOT] -- its rows in the pool planes buf = (k, v, g, b) [conversations, H, cap, chan] and its
++    committed count h_devs[slot] -- from rec[slot, parity] (read only) and writes its rows' read-out at the
++    stream's window rows row0 + the row within the buffer, like ``step_seg_kernel``'s y_out."""
++
++    k, v, g, b = buf
++    _ext().out_only_seg(seg, rec, k, v, g, b, q_in, h_devs, y_out)

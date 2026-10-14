@@ -181,6 +181,15 @@ export TF_GLM_HC_SPLIT="$SPLIT" TF_GLM_PREFILL_OVERLAP="$([[ "$SPLIT" == 1 ]] &&
 # Close to the serial kernel, not its bits: prompt arithmetic differs, drafted replies still equal serial ones. 0: off.
 KDA_CHUNKED="${KDA_CHUNKED:-1}"
 export TF_GLM_KDA_CHUNKED="$KDA_CHUNKED"
+# ReplaySSM (patch 0109, after arXiv 2610.13778): KDA decode keeps a checkpoint plus a buffer of recent SSM inputs;
+# most decode rounds compute outputs from the checkpoint without writing the state (writes happen at flushes, every
+# KDA_REPLAY_LEN committed tokens), and rejected drafts roll back by moving the buffer pointer instead of a state
+# replay. Every round's outputs and every flush's checkpoint are the eager path's bits (the replay re-runs the serial
+# update over the buffered rows). Single-stream decode only: the engine refuses to start with PARALLEL > 1 while set.
+# TF_GLM_KDA_REPLAY_LEN is the window (16, the paper's L). 0: off (the eager per-round state write, as before).
+KDA_REPLAY="${KDA_REPLAY:-0}"
+KDA_REPLAY_LEN="${KDA_REPLAY_LEN:-16}"
+export TF_GLM_KDA_REPLAY="$KDA_REPLAY" TF_GLM_KDA_REPLAY_LEN="$KDA_REPLAY_LEN"
 # Code-workload copy drafts (patch 0032): 16-row verify windows as CUDA graphs, and a copy from the reply itself only
 # when its last 16 tokens match: code 55.4 -> 56.2 tok/s, edit 120 -> 125 (with the overlap above, two boots each).
 # Exact. 0: off.

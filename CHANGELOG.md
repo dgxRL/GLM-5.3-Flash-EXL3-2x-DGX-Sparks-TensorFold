@@ -1,10 +1,17 @@
-# Changelog
+## Changelog
 
 Every change to this recipe, newest first. Each release names the image it serves: `scripts/prepare.sh` pulls
 `ghcr.io/miaai-lab/glm-5.3-flash-exl3-2x-dgx-sparks-tensorfold` by the digest pinned in `scripts/config.sh`.
 
 ## Unreleased
 
+- **ReplaySSM for KDA decode** (patch `0109-glm-kda-replayssm`, after arXiv 2610.13778): the KDA layers represent
+  their state as a checkpoint plus a bounded buffer of recent SSM inputs, so a decode round computes its outputs from
+  the checkpoint without writing the state (flushes fold the buffer in every `KDA_REPLAY_LEN` committed tokens), and
+  rejected drafts roll back by moving the buffer pointer instead of the eager state replay. The replay re-runs the
+  serial update over the buffered rows, so every round's outputs and every flush's checkpoint are the eager path's
+  bits. Off by default (`KDA_REPLAY=0`) and single-stream decode only for now: the engine refuses to start with
+  `PARALLEL` above 1 while it is set. On-Spark validation and measurements pending.
 - **A prompt that fills beside other replies, ~10-14% sooner** (`FILL_ROWS`, by [BadAd84](https://github.com/BadAd84)):
   while other requests decode, a new prompt filled in 1,024-row chunks (TensorFold's `TF_GLM_FILL_ROWS` default),
   half the 2,048-row prompt chunk whose buffers the engine keeps anyway. `scripts/config.sh` now sets 2,048 (at
